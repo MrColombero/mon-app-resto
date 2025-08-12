@@ -1,0 +1,264 @@
+# ==========================
+# BACKEND: Django (models.py, serializers.py, permissions.py, stats.py, views.py, urls.py)
+# ==========================
+
+# models.py
+from django.db import models
+from django.contrib.auth.models import AbstractUser
+from phonenumber_field.modelfields import PhoneNumberField
+from django.core.validators import MinValueValidator
+
+class Role(models.TextChoices):
+    ADMIN = 'admin', 'Admin'
+    MANAGER = 'manager', 'Manager'
+    STAFF = 'staff', 'Staff'
+
+class User(AbstractUser):
+    role = models.CharField(max_length=20, choices=Role.choices, default=Role.MANAGER)
+    full_name = models.CharField(max_length=100)
+
+    class Meta:
+        # Ensure AUTH_USER_MODEL = 'your_app.User' in settings.py
+        pass
+
+    def __str__(self):
+        return self.full_name or self.username
+
+class Table(models.Model):
+    label = models.CharField(max_length=10, unique=True)
+    capacity = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    location = models.CharField(max_length=100, choices=[('intérieur', 'Intérieur'), ('terrasse', 'Terrasse'), ('étage', 'Étage')])
+    mergeable = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['location'])]
+
+    def __str__(self):
+        return f"{self.label} ({self.location})"
+
+class Service(models.Model):
+    name = models.CharField(max_length=100)
+    date = models.DateField()
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('name', 'date')
+        indexes = [models.Index(fields=['date'])]
+
+    def __str__(self):
+        return f"{self.name} ({self.date})"
+
+class Reservation(models.Model):
+    customer = models.CharField(max_length=100)
+    phone = PhoneNumberField()
+    service = models.ForeignKey(Service, on_delete=models.CASCADE, related_name='reservations')
+    table = models.ForeignKey(Table, on_delete=models.SET_NULL, null=True, blank=True)
+    nb_guests = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.customer} - {self.service.name}"
+
+class StaffShift(models.Model):
+    SHIFT_ROLES = [
+        ('salle', 'Salle'),
+        ('cuisine', 'Cuisine'),
+        ('bar', 'Bar'),
+    ]
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='shifts')
+    service = models.ForeignKey(Service, on_delete=models.CASCADE, related_name='shifts')
+    role = models.CharField(max_length=20, choices=SHIFT_ROLES)
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.user.full_name} - {self.role} ({self.service})"
+
+# serializers.py
+from rest_framework import serializers
+from .models import Service, Reservation, Table, StaffShift, User
+
+class UserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['id', 'full_name', 'role']
+
+class TableSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Table
+        fields = ['id', 'label', 'capacity', 'location', 'mergeable', 'created_at']
+
+class ServiceSerializer(serializers.ModelSerializer):
+    reservations = ReservationSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Service
+        fields = ['id', 'name', 'date', 'start_time', 'end_time', 'created_at', 'reservations']
+
+class ReservationSerializer(serializers.ModelSerializer):
+    table = TableSerializer(read_only=True)
+    service = ServiceSerializer(read_only=True)
+    table_id = serializers.PrimaryKeyRelatedField(
+        queryset=Table.objects.all(), source='table', write_only=True, allow_null=True
+    )
+    service_id = serializers.PrimaryKeyRelatedField(
+        queryset=Service.objects.all(), source='service', write_only=True
+    )
+
+    class Meta:
+        model = Reservation
+        fields = ['id', 'customer', 'phone', 'service', 'service_id', 'table', 'table_id', 'nb_guests', 'created_at']
+
+    def validate(self, data):
+        if data.get('table') and data['nb_guests'] > data['table'].capacity:
+            raise serializers.ValidationError("Number of guests exceeds table capacity.")
+        return data
+
+class StaffShiftSerializer(serializers.ModelSerializer):
+    user = UserSerializer(read_only=True)
+    service = ServiceSerializer(read_only=True)
+    user_id = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(), source='user', write_only=True
+    )
+    service_id = serializers.PrimaryKeyRelatedField(
+        queryset=Service.objects.all(), source='service', write_only=True
+    )
+
+    class Meta:
+        model = StaffShift
+        fields = ['id', 'user', 'user_id', 'service', 'service_id', 'role', 'assigned_at']
+
+# permissions.py
+from rest_framework.permissions import BasePermission
+from .models import Role
+
+class IsRole(BasePermission):
+    allowed_roles = []
+
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and request.user.role in self.allowed_roles
+
+class IsAdmin(IsRole):
+    allowed_roles = [Role.ADMIN]
+
+class IsManager(IsRole):
+    allowed_roles = [Role.ADMIN, Role.MANAGER]
+
+class IsStaff(IsRole):
+    allowed_roles = [Role.ADMIN, Role.MANAGER, Role.STAFF]
+
+class IsOwnShift(BasePermission):
+    def has_object_permission(self, request, view, obj):
+        return request.user.is_authenticated and (request.user == obj.user or request.user.role in [Role.ADMIN, Role.MANAGER])
+
+# stats.py
+from django.db.models import Count, Avg
+from .models import Reservation
+from datetime import date
+
+def get_reservation_stats():
+    today = date.today()
+    reservations = Reservation.objects.select_related('service', 'table').filter(
+        service__date__year=today.year
+    )
+    total_today = reservations.filter(service__date=today).count()
+    total_month = reservations.filter(service__date__month=today.month).count()
+    avg_guests = reservations.aggregate(avg=Avg('nb_guests'))['avg'] or 0
+    by_location = reservations.values('table__location').annotate(count=Count('id'))
+    location_stats = {item['table__location'] or 'Unassigned': item['count'] for item in by_location}
+
+    return {
+        "total_today": total_today,
+        "total_this_month": total_month,
+        "average_guests_per_reservation": round(avg_guests, 2) if avg_guests else 0,
+        "reservations_by_location": location_stats
+    }
+
+# views.py
+from rest_framework.generics import ListCreateAPIView
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from .permissions import IsAdmin, IsManager, IsStaff, IsOwnShift
+from .models import Service, Table, Reservation, StaffShift
+from .serializers import ServiceSerializer, TableSerializer, ReservationSerializer, StaffShiftSerializer
+from .stats import get_reservation_stats
+
+class StandardResultsSetPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+class ServiceListView(ListCreateAPIView):
+    permission_classes = [IsAuthenticated, IsManager]
+    queryset = Service.objects.all().order_by('date', 'start_time')
+    serializer_class = ServiceSerializer
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        date = self.request.query_params.get('date')
+        if date:
+            queryset = queryset.filter(date=date)
+        return queryset
+
+class TableListView(ListCreateAPIView):
+    permission_classes = [IsAuthenticated, IsManager]
+    queryset = Table.objects.all().order_by('label')
+    serializer_class = TableSerializer
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        location = self.request.query_params.get('location')
+        if location:
+            queryset = queryset.filter(location=location)
+        return queryset
+
+class ReservationListView(ListCreateAPIView):
+    permission_classes = [IsAuthenticated]
+    queryset = Reservation.objects.select_related('service', 'table').order_by('-created_at')
+    serializer_class = ReservationSerializer
+    pagination_class = StandardResultsSetPagination
+
+class StaffShiftListView(ListCreateAPIView):
+    permission_classes = [IsAuthenticated, IsManager]
+    queryset = StaffShift.objects.select_related('user', 'service').order_by('assigned_at')
+    serializer_class = StaffShiftSerializer
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.request.user.role == Role.STAFF:
+            queryset = queryset.filter(user=self.request.user)
+        return queryset
+
+class StatsView(APIView):
+    permission_classes = [IsAuthenticated, IsManager]
+
+    def get(self, request):
+        try:
+            stats = get_reservation_stats()
+            return Response(stats)
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+# urls.py
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+from .views import ServiceListView, TableListView, ReservationListView, StaffShiftListView, StatsView
+
+router = DefaultRouter()
+router.register('services', ServiceListView, basename='service')
+router.register('tables', TableListView, basename='table')
+router.register('reservations', ReservationListView, basename='reservation')
+router.register('shifts', StaffShiftListView, basename='shift')
+
+urlpatterns = [
+    path('api/', include(router.urls)),
+    path('api/stats/', StatsView.as_view(), name='stats'),
+]
+
